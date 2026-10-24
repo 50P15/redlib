@@ -14,7 +14,8 @@ use std::borrow::Cow;
 use std::result::Result;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU16};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
+use wreq::cookie::Jar;
 use wreq::dns::{Addrs, Name, Resolve, Resolving};
 use wreq::redirect::Policy;
 use wreq::{header as wreq_header, Client as WreqClient, Method, Response as WreqResponse};
@@ -29,6 +30,20 @@ const REDDIT_SHORT_URL_BASE_HOST: &str = "redd.it";
 const ALTERNATIVE_REDDIT_URL_BASE: &str = "https://www.reddit.com";
 const ALTERNATIVE_REDDIT_URL_BASE_HOST: &str = "www.reddit.com";
 const ALTERNATIVE_REDDIT_DNS_HOST: &str = "dualstack.reddit.map.fastly.net";
+
+const SHREDDIT_PATH_PREFIX: &str = "/svc/shreddit/";
+// Asks for the bare fragment instead of a full page shell, roughly halving the response.
+const SHREDDIT_PARTIAL_ACCEPT: &str = "text/vnd.reddit.partial+html, text/html;q=0.9";
+// Reddit answers rate-limited shreddit requests with this reCAPTCHA page and a 200 status.
+const SHREDDIT_CHALLENGE_TITLE: &str = "<title>Reddit - Prove your humanity</title>";
+
+// Logged-out reddit.com session shared by shreddit requests. Reddit challenges
+// cookieless clients after about ten requests, but gives each session a budget
+// of a couple hundred requests. It is kept apart from the OAuth API requests on purpose.
+static SHREDDIT_SESSION: LazyLock<Arc<Jar>> = LazyLock::new(Arc::default);
+// Leaves room for the requests already in flight when the session is rotated.
+const SHREDDIT_RATELIMIT_ROTATE_BELOW: f32 = 20.0;
+const SHREDDIT_MAX_REDIRECTS: usize = 3;
 
 pub static CLIENT: LazyLock<WreqClient> = LazyLock::new(build_client);
 
@@ -238,6 +253,96 @@ pub async fn proxy(req: HyperRequest<Body>, format: &str) -> Result<HyperRespons
 		.map_err(|e| e.to_string())
 }
 
+/// Fetch a server-rendered HTML fragment from Reddit's web frontend.
+///
+/// These are the fragments reddit.com loads for logged-out visitors, so they
+/// are sent without the spoofed OAuth client's headers. A `cursor` turns the
+/// request into the form POST used to expand a "more comments" placeholder.
+pub async fn shreddit_fragment(path: String, cursor: Option<String>) -> Result<String, String> {
+	if !path.starts_with(SHREDDIT_PATH_PREFIX) {
+		return Err(format!("Refusing to fetch non-shreddit path | {path}"));
+	}
+
+	if let Some(body) = shreddit_request(&path, cursor.as_deref()).await? {
+		return Ok(body);
+	}
+
+	warn!("Reddit rate limited the shreddit session, starting a new one");
+	SHREDDIT_SESSION.clear();
+	shreddit_request(&path, cursor.as_deref())
+		.await?
+		.ok_or_else(|| format!("Reddit is rate limiting comment requests. Try refreshing in a few seconds. | {path}"))
+}
+
+/// Returns `Ok(None)` when Reddit rate limits or challenges the session.
+async fn shreddit_request(path: &str, cursor: Option<&str>) -> Result<Option<String>, String> {
+	// Reddit's bot check answers some clients with a 302 to the same path plus an
+	// `rdt` query parameter and cookie, so a few redirects are expected. The
+	// original method and cursor are kept so "more comments" POSTs still work.
+	let mut target = path.to_owned();
+	for _ in 0..=SHREDDIT_MAX_REDIRECTS {
+		let response = shreddit_send(&target, cursor).await?;
+		if !response.status().is_redirection() {
+			return shreddit_body(response, path).await;
+		}
+
+		let location = response.headers().get(wreq_header::LOCATION).and_then(|value| value.to_str().ok()).unwrap_or_default();
+		target = shreddit_redirect_target(location)
+			.ok_or_else(|| format!("Reddit redirected the comments request to {location:?} | {path}"))?
+			.to_owned();
+	}
+	Err(format!("Reddit redirected the comments request too many times | {path}"))
+}
+
+/// Resolves a redirect `Location` to a shreddit path on reddit.com, refusing anything else.
+fn shreddit_redirect_target(location: &str) -> Option<&str> {
+	let path = location.strip_prefix(ALTERNATIVE_REDDIT_URL_BASE).unwrap_or(location);
+	path.starts_with(SHREDDIT_PATH_PREFIX).then_some(path)
+}
+
+async fn shreddit_send(path: &str, cursor: Option<&str>) -> Result<WreqResponse, String> {
+	let url = format!("{ALTERNATIVE_REDDIT_URL_BASE}{path}");
+
+	let builder = match cursor {
+		Some(cursor) => CLIENT
+			.post(&url)
+			.header(wreq_header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+			.body(url::form_urlencoded::Serializer::new(String::new()).append_pair("cursor", cursor).finish()),
+		None => CLIENT.get(&url),
+	};
+
+	builder
+		.header(wreq_header::ACCEPT, SHREDDIT_PARTIAL_ACCEPT)
+		.cookie_provider(Arc::clone(&SHREDDIT_SESSION))
+		.send()
+		.await
+		.map_err(|e| format!("Couldn't send request to Reddit: {e} | {path}"))
+}
+
+/// Returns `Ok(None)` when Reddit rate limits or challenges the session.
+async fn shreddit_body(response: WreqResponse, path: &str) -> Result<Option<String>, String> {
+	let status = response.status();
+	if status == wreq::StatusCode::TOO_MANY_REQUESTS {
+		return Ok(None);
+	}
+	if !status.is_success() {
+		return Err(format!("Reddit returned {status} | {path}"));
+	}
+
+	let remaining = response
+		.headers()
+		.get("x-ratelimit-remaining")
+		.and_then(|value| value.to_str().ok())
+		.and_then(|value| value.parse::<f32>().ok());
+	if remaining.is_some_and(|remaining| remaining < SHREDDIT_RATELIMIT_ROTATE_BELOW) {
+		trace!("Shreddit session rate limit is low ({remaining:?} remaining), starting a new one");
+		SHREDDIT_SESSION.clear();
+	}
+
+	let body = response.text().await.map_err(|e| format!("Failed receiving body from Reddit: {e} | {path}"))?;
+	Ok((!body.contains(SHREDDIT_CHALLENGE_TITLE)).then_some(body))
+}
+
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP
 /// 3xx codes Reddit returns and will automatically redirect.
 fn reddit_get(path: String, quarantine: bool) -> Boxed<Result<WreqResponse, String>> {
@@ -405,12 +510,6 @@ fn comments_logical_path(path: &str) -> String {
 /// Make a request to a Reddit API and parse the JSON response
 #[cached(size = 100, time = 30, result = true)]
 pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
-	json_uncached(path, quarantine).await
-}
-
-/// Uncached variant used by the opt-in diagnostic harness. Application code
-/// should use [`json`] so successful responses retain the normal 30s cache.
-pub async fn json_uncached(path: String, quarantine: bool) -> Result<Value, String> {
 	// Closure to quickly build errors
 	let err = |msg: &str, e: String, path: String| -> Result<Value, String> {
 		// eprintln!("{} - {}: {}", url, msg, e);
@@ -431,12 +530,6 @@ pub async fn json_uncached(path: String, quarantine: bool) -> Result<Value, Stri
 	match reddit_get(path.clone(), quarantine).await {
 		Ok(response) => {
 			let status = response.status();
-			let content_type = response
-				.headers()
-				.get(wreq_header::CONTENT_TYPE)
-				.and_then(|value| value.to_str().ok())
-				.unwrap_or_default()
-				.to_ascii_lowercase();
 
 			let reset: Option<String> = if let (Some(remaining), Some(reset), Some(used)) = (
 				response.headers().get("x-ratelimit-remaining").and_then(|val| val.to_str().ok().map(|s| s.to_string())),
@@ -458,25 +551,21 @@ pub async fn json_uncached(path: String, quarantine: bool) -> Result<Value, Stri
 				None
 			};
 
-			// Reddit sometimes returns an HTML policy page for blocked API routes.
-			// Report that accurately and never treat it as an expired OAuth token.
-			if status.as_u16() == 403 && content_type.starts_with("text/html") {
-				return Err("Reddit blocked anonymous access to this endpoint".to_string());
-			}
-			if status.as_u16() == 429 {
-				return Err(reset.map_or_else(
-					|| "Reddit rate limit exceeded".to_string(),
-					|seconds| format!("Reddit rate limit exceeded. Rate limit will reset in: {seconds}"),
-				));
-			}
-
 			// asynchronously aggregate the chunks of the body
 			match hyper::body::aggregate(response.into_hyper_response()).await {
 				Ok(body) => {
 					let has_remaining = body.has_remaining();
 
 					if !has_remaining {
-						return Err(format!("Reddit returned an empty response with HTTP {status}"));
+						// Rate limited, so spawn a force_refresh_token()
+						tokio::spawn(force_refresh_token());
+						return match reset {
+							Some(val) => Err(format!(
+								"Reddit rate limit exceeded. Try refreshing in a few seconds.\
+								 Rate limit will reset in: {val}"
+							)),
+							None => Err("Reddit rate limit exceeded".to_string()),
+						};
 					}
 
 					// Parse the response from Reddit as JSON
@@ -671,6 +760,31 @@ mod tests {
 		}
 	}
 
+	#[test]
+	fn test_shreddit_redirect_target() {
+		for (location, expected) in [
+			("/svc/shreddit/comments/r/rust/t3_abc?rdt=50895", Some("/svc/shreddit/comments/r/rust/t3_abc?rdt=50895")),
+			(
+				"https://www.reddit.com/svc/shreddit/more-comments/rust/t3_abc?rdt=1",
+				Some("/svc/shreddit/more-comments/rust/t3_abc?rdt=1"),
+			),
+			("/login/?dest=%2Fsvc%2Fshreddit%2F", None),
+			("https://www.reddit.com.evil.example/svc/shreddit/x", None),
+			("https://evil.example/svc/shreddit/x", None),
+			("//evil.example/svc/shreddit/x", None),
+			("", None),
+		] {
+			assert_eq!(shreddit_redirect_target(location), expected, "{location}");
+		}
+	}
+
+	#[tokio::test]
+	async fn test_shreddit_fragment_rejects_other_paths() {
+		for path in ["/api/v1/me", "https://evil.example/svc/shreddit/x", "/svc/shreddit"] {
+			let error = shreddit_fragment(path.to_string(), None).await.unwrap_err();
+			assert!(error.starts_with("Refusing to fetch non-shreddit path"), "{path}: {error}");
+		}
+	}
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_rate_limit_check() {
 		rate_limit_check().await.unwrap();

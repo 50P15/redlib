@@ -16,6 +16,7 @@ env:
 
 jobs:
   build:
+    if: github.repository == 'redlib-org/redlib'
     name: Rust project - latest
     runs-on: ubuntu-latest
     strategy:
@@ -50,6 +51,5 @@ jobs:
           body: |
             - ${{ github.event.head_commit.message }} ${{ github.sha }}
           generate_release_notes: true
-
 
 
