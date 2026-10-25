@@ -1,25 +1,47 @@
-name: Publish GHCR image
+name: Publish GHCR image (arm64)
 
 on:
   push:
     branches:
       - main
+  schedule:
+    - cron: "30 3 * * *" # sincroniza con xevxx/redlib cada dia a las 03:30 UTC
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 env:
-  IMAGE: ghcr.io/xevxx/redlib
+  IMAGE: ghcr.io/50p15/redlib
 
 jobs:
-  publish:
+  sync:
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+    steps:
+      - name: Sync fork with upstream
+        id: sync
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          before=$(gh api repos/${{ github.repository }}/commits/main --jq .sha)
+          gh api -X POST repos/${{ github.repository }}/merge-upstream -f branch=main
+          after=$(gh api repos/${{ github.repository }}/commits/main --jq .sha)
+          if [ "$before" != "$after" ]; then echo "changed=true" >> "$GITHUB_OUTPUT"; else echo "changed=false" >> "$GITHUB_OUTPUT"; fi
+
+  publish:
+    needs: sync
+    if: always() && (github.event_name != 'schedule' || needs.sync.outputs.changed == 'true')
+    runs-on: ubuntu-24.04-arm
 
     steps:
       - name: Check out source
         uses: actions/checkout@v6
+        with:
+          ref: main
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -44,13 +66,10 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: ./Dockerfile.alpine
-          platforms: linux/amd64
+          file: ./Dockerfile.arm64
+          platforms: linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          build-args: |
-            RUST_CROSS_IMAGE=x86_64-musl
-            RUST_TARGET=x86_64-unknown-linux-musl
