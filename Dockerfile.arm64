@@ -1,0 +1,17 @@
+# Build nativo (glibc) para linux/arm64. Usado por .github/workflows/ghcr.yml
+FROM rust:1-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends cmake clang libclang-dev perl git \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+RUN cargo build --release --bin redlib && strip target/release/redlib
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates wget \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -M -s /usr/sbin/nologin redlib
+COPY --from=build /src/target/release/redlib /usr/local/bin/redlib
+USER redlib
+EXPOSE 8080
+HEALTHCHECK --interval=1m --timeout=3s CMD wget --spider -q http://localhost:8080/settings || exit 1
+CMD ["redlib"]
