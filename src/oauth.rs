@@ -317,6 +317,20 @@ pub(crate) async fn session_token(cookie: &str) -> Result<(String, u64), String>
 	Ok((response.token, response.expires_in))
 }
 
+/// Headers of a fresh anonymous mobile token for live integration tests.
+#[cfg(test)]
+pub(crate) async fn android_headers() -> Result<HashMap<String, String>, String> {
+	let mut backend = MobileSpoofAuth::new();
+	let response = backend.authenticate_with(Grant::Loid).await.map_err(|error| match error {
+		AuthError::Wreq(error) => error.to_string(),
+		AuthError::SerdeDeserialize(error) => error.to_string(),
+		AuthError::Field(field) => format!("no {field} in Reddit's answer"),
+	})?;
+	let mut headers = backend.get_headers();
+	headers.insert("Authorization".to_owned(), format!("Bearer {}", response.token));
+	Ok(headers)
+}
+
 impl OauthBackend for MobileSpoofAuth {
 	async fn authenticate(&mut self) -> Result<OauthResponse, AuthError> {
 		self.authenticate_with(Grant::Loid).await

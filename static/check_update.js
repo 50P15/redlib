@@ -23,8 +23,7 @@ async function checkInstanceUpdateStatus() {
                 statusMessage = `⚠️ This instance is not up to date and is ${commitIndex} commits old. Test and confirm on an up-to-date instance before reporting.`;
                 document.getElementById('error-446')?.remove();
             } else {
-                statusMessage = `⚠️ This instance is not up to date and is at least ${commitHashes.length} commits old. Test and confirm on an up-to-date instance before reporting.`;
-                document.getElementById('error-446')?.remove();
+                statusMessage = `ℹ️ This instance is running custom commit ${localCommit.slice(0, 7)}, which is not in upstream's recent history.`;
             }
         } else {
             statusMessage = '⚠️ Unable to fetch commit information.';

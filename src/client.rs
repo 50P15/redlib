@@ -102,8 +102,8 @@ impl Resolve for RedditDnsResolver {
 pub fn build_client() -> WreqClient {
 	// Keep one current browser fingerprint so instances do not randomly select
 	// a profile that Reddit is already blocking.
-	let profile = Profile::SafariIos26_2;
-	let platform = Platform::IOS;
+	let profile = Profile::Safari26_4;
+	let platform = Platform::MacOS;
 	info!("Building anonymous Wreq client with emulation {profile:?} on {platform:?}");
 	build_emulated_client(profile, platform)
 }
@@ -720,8 +720,22 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 			let mut response = response;
 			let mut from_web_session = false;
 
-			// Reddit answers some logged-out JSON requests with an HTML block
-			// page. Retry only those requests against the web host with the
+			// Reddit refuses some listing JSON routes on both JSON hosts. Its
+			// app GraphQL endpoint still serves them, so try that before spending
+			// the configured account session's request budget.
+			if response.status() == wreq::StatusCode::FORBIDDEN {
+				if let Some(gql_response) = crate::gql::listing(&path).await {
+					match gql_response {
+						Ok(listing) => {
+							trace!("Loaded {path} through Reddit GraphQL after JSON returned 403");
+							return Ok(listing);
+						}
+						Err(error) => warn!("Couldn't load {path} through Reddit GraphQL: {error}"),
+					}
+				}
+			}
+
+			// Retry other blocked JSON requests against the web host with the
 			// configured session.
 			if response.status() == wreq::StatusCode::FORBIDDEN {
 				if let Some(cookie) = &session {
