@@ -136,31 +136,6 @@ pub async fn item(req: Request<Body>) -> Result<Response<Body>, String> {
 	}
 }
 
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn test_thread_json_path_adds_default_sort() {
-		let req = Request::builder().uri("/r/rust/comments/abc/title/?context=3&q=hello%20world").body(Body::empty()).unwrap();
-
-		assert_eq!(
-			thread_json_path(&req, "confidence"),
-			"/r/rust/comments/abc/title/.json?context=3&q=hello+world&sort=confidence&raw_json=1"
-		);
-	}
-
-	#[test]
-	fn test_thread_json_path_preserves_explicit_sort() {
-		let req = Request::builder()
-			.uri("/r/rust/comments/abc/title/comment/?sort=new&raw_json=0")
-			.body(Body::empty())
-			.unwrap();
-
-		assert_eq!(thread_json_path(&req, "confidence"), "/r/rust/comments/abc/title/comment/.json?sort=new&raw_json=1");
-	}
-}
-
 // COMMENTS
 
 fn parse_comments(json: &serde_json::Value, post_link: &str, post_author: &str, highlighted_comment: &str, filters: &HashSet<String>, req: &Request<Body>) -> Vec<Comment> {
@@ -302,5 +277,30 @@ fn build_comment(
 		is_filtered,
 		more_count,
 		prefs: Preferences::new(req),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn test_thread_json_path_adds_default_sort() {
+		let req = Request::builder().uri("/r/rust/comments/abc/title/?context=3&q=hello%20world").body(Body::empty()).unwrap();
+
+		assert_eq!(
+			thread_json_path(&req, "confidence"),
+			"/r/rust/comments/abc/title/.json?context=3&q=hello+world&sort=confidence&raw_json=1"
+		);
+	}
+
+	#[test]
+	fn test_thread_json_path_preserves_explicit_sort() {
+		let req = Request::builder()
+			.uri("/r/rust/comments/abc/title/comment/?sort=new&raw_json=0")
+			.body(Body::empty())
+			.unwrap();
+
+		assert_eq!(thread_json_path(&req, "confidence"), "/r/rust/comments/abc/title/comment/.json?sort=new&raw_json=1");
 	}
 }
