@@ -1,6 +1,6 @@
 use crate::config::get_setting;
 use crate::dbg_msg;
-use crate::oauth::{force_refresh_token, token_daemon, Oauth, OauthBackendImpl};
+use crate::oauth::{force_refresh_token, session_token, token_daemon, Oauth, OauthBackendImpl};
 use crate::server::RequestExt;
 use crate::utils::{format_url, Post};
 use arc_swap::ArcSwap;
@@ -16,6 +16,7 @@ use std::result::Result;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU16};
 use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
 use wreq::cookie::Jar;
 use wreq::dns::{Addrs, Name, Resolve, Resolving};
 use wreq::redirect::Policy;
@@ -101,8 +102,8 @@ impl Resolve for RedditDnsResolver {
 pub fn build_client() -> WreqClient {
 	// Keep one current browser fingerprint so instances do not randomly select
 	// a profile that Reddit is already blocking.
-	let profile = Profile::SafariIos26_2;
-	let platform = Platform::IOS;
+	let profile = Profile::Safari26_4;
+	let platform = Platform::MacOS;
 	info!("Building anonymous Wreq client with emulation {profile:?} on {platform:?}");
 	build_emulated_client(profile, platform)
 }
@@ -169,7 +170,7 @@ fn non_json_response_error(status: u16, parse_error: &str, path: &str, session_c
 		return if session_configured {
 			format!(
 				"Reddit refused this request (403 Forbidden) with {REDDIT_COOKIE_SETTING}. \
-				 The session has probably expired; replace it with a fresh cookie. | {path}"
+				 The session may have expired, or Reddit may be blocking this endpoint. | {path}"
 			)
 		} else {
 			format!(
@@ -214,12 +215,50 @@ fn reset_shreddit_session() {
 
 /// Retry a blocked API path on reddit.com with the configured web session.
 async fn reddit_web_get(path: &str, cookie: &str) -> Result<WreqResponse, String> {
+	let response = reddit_session_get(path, cookie).await?;
+	if response.status() != wreq::StatusCode::FORBIDDEN {
+		return Ok(response);
+	}
+
+	// Reddit refuses some listings (notably /new) on the web JSON host even
+	// for valid sessions. A token minted from that session can use the API host.
+	trace!("Reddit refused {path} on www; retrying with a session-bound API token");
+	let token = cached_session_token(cookie).await?;
+	reddit_get_as(path.to_owned(), token).await
+}
+
+async fn reddit_session_get(path: &str, cookie: &str) -> Result<WreqResponse, String> {
 	SESSION_CLIENT
 		.get(format!("{ALTERNATIVE_REDDIT_URL_BASE}{path}"))
 		.header(wreq_header::COOKIE, cookie)
 		.send()
 		.await
 		.map_err(|e| e.to_string())
+}
+
+#[derive(Clone)]
+struct CachedSessionToken {
+	cookie: String,
+	token: String,
+	expires_at: Instant,
+}
+
+static SESSION_TOKEN: tokio::sync::Mutex<Option<CachedSessionToken>> = tokio::sync::Mutex::const_new(None);
+
+async fn cached_session_token(cookie: &str) -> Result<String, String> {
+	let mut cached = SESSION_TOKEN.lock().await;
+	let refresh_before = Instant::now() + Duration::from_secs(60);
+	if let Some(token) = cached.as_ref().filter(|token| token.cookie == cookie && token.expires_at > refresh_before) {
+		return Ok(token.token.clone());
+	}
+
+	let (token, expires_in) = session_token(cookie).await?;
+	*cached = Some(CachedSessionToken {
+		cookie: cookie.to_owned(),
+		token: token.clone(),
+		expires_at: Instant::now() + Duration::from_secs(expires_in),
+	});
+	Ok(token)
 }
 
 /// Gets the canonical path for a resource on Reddit. This is accomplished by
@@ -439,7 +478,7 @@ async fn shreddit_body(response: WreqResponse, path: &str) -> Result<Option<Stri
 	}
 	if status == wreq::StatusCode::FORBIDDEN {
 		return Err(if session_cookie().is_some() {
-			format!("Reddit refused the configured session cookie (403 Forbidden). Replace {REDDIT_COOKIE_SETTING}. | {path}")
+			format!("Reddit refused the configured session cookie (403 Forbidden). The session may have expired, or Reddit may be blocking this endpoint. | {path}")
 		} else {
 			format!("Reddit now requires a logged-in session for comments. Set {REDDIT_COOKIE_SETTING}. | {path}")
 		});
@@ -465,12 +504,30 @@ async fn shreddit_body(response: WreqResponse, path: &str) -> Result<Option<Stri
 /// Makes a GET request to Reddit at `path`. By default, this will honor HTTP
 /// 3xx codes Reddit returns and will automatically redirect.
 fn reddit_get(path: String, quarantine: bool) -> Boxed<Result<WreqResponse, String>> {
-	request(&Method::GET, path, true, quarantine, REDDIT_URL_BASE, REDDIT_URL_BASE_HOST)
+	request(&Method::GET, path, true, quarantine, REDDIT_URL_BASE, REDDIT_URL_BASE_HOST, None)
+}
+
+/// Makes an API request with an OAuth token minted from a Reddit web session.
+fn reddit_get_as(path: String, token: String) -> Boxed<Result<WreqResponse, String>> {
+	request(&Method::GET, path, true, false, REDDIT_URL_BASE, REDDIT_URL_BASE_HOST, Some(token))
+}
+
+/// Session tokens must not inherit the anonymous token's session identifiers.
+fn oauth_headers(headers: std::collections::HashMap<String, String>, token: Option<&str>) -> Vec<(String, String)> {
+	let Some(token) = token else {
+		return headers.into_iter().collect();
+	};
+
+	headers
+		.into_iter()
+		.filter(|(key, _)| !matches!(key.as_str(), "x-reddit-loid" | "x-reddit-session"))
+		.map(|(key, value)| if key == "Authorization" { (key, format!("Bearer {token}")) } else { (key, value) })
+		.collect()
 }
 
 /// Makes a HEAD request to Reddit at `path, using the short URL base. This will not follow redirects.
 fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str, host: &'static str) -> Boxed<Result<WreqResponse, String>> {
-	request(&Method::HEAD, path, false, quarantine, base_path, host)
+	request(&Method::HEAD, path, false, quarantine, base_path, host, None)
 }
 
 // /// Makes a HEAD request to Reddit at `path`. This will not follow redirects.
@@ -482,7 +539,15 @@ fn reddit_short_head(path: String, quarantine: bool, base_path: &'static str, ho
 /// Makes a request to Reddit. If `redirect` is `true`, `request_with_redirect`
 /// will recurse on the URL that Reddit provides in the Location HTTP header
 /// in its response.
-fn request(method: &'static Method, path: String, redirect: bool, quarantine: bool, base_path: &'static str, host: &'static str) -> Boxed<Result<WreqResponse, String>> {
+fn request(
+	method: &'static Method,
+	path: String,
+	redirect: bool,
+	quarantine: bool,
+	base_path: &'static str,
+	host: &'static str,
+	token: Option<String>,
+) -> Boxed<Result<WreqResponse, String>> {
 	// Keep the logical path unchanged for caches and diagnostics. Reddit blocks
 	// literal anonymous comments routes, so only rewrite the outgoing URL.
 	let transport_path = comments_transport_path(&path);
@@ -502,7 +567,7 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 
 	{
 		let client = OAUTH_CLIENT.load_full();
-		for (key, value) in client.headers_map.clone() {
+		for (key, value) in oauth_headers(client.headers_map.clone(), token.as_deref()) {
 			headers.push((key, value));
 		}
 	}
@@ -557,6 +622,7 @@ fn request(method: &'static Method, path: String, redirect: bool, quarantine: bo
 						quarantine,
 						base_path,
 						host,
+						token,
 					)
 					.await;
 				};
@@ -654,8 +720,22 @@ pub async fn json(path: String, quarantine: bool) -> Result<Value, String> {
 			let mut response = response;
 			let mut from_web_session = false;
 
-			// Reddit answers some logged-out JSON requests with an HTML block
-			// page. Retry only those requests against the web host with the
+			// Reddit refuses some listing JSON routes on both JSON hosts. Its
+			// app GraphQL endpoint still serves them, so try that before spending
+			// the configured account session's request budget.
+			if response.status() == wreq::StatusCode::FORBIDDEN {
+				if let Some(gql_response) = crate::gql::listing(&path).await {
+					match gql_response {
+						Ok(listing) => {
+							trace!("Loaded {path} through Reddit GraphQL after JSON returned 403");
+							return Ok(listing);
+						}
+						Err(error) => warn!("Couldn't load {path} through Reddit GraphQL: {error}"),
+					}
+				}
+			}
+
+			// Retry other blocked JSON requests against the web host with the
 			// configured session.
 			if response.status() == wreq::StatusCode::FORBIDDEN {
 				if let Some(cookie) = &session {
@@ -972,6 +1052,22 @@ mod tests {
 
 		let login = non_json_response_error(302, "", "/comments/abc.json", true);
 		assert!(login.contains("redirected"), "{login}");
+	}
+
+	#[test]
+	fn test_session_oauth_headers_replace_anonymous_identity() {
+		let headers = std::collections::HashMap::from([
+			("Authorization".to_owned(), "Bearer anonymous".to_owned()),
+			("User-Agent".to_owned(), "Reddit/test".to_owned()),
+			("x-reddit-loid".to_owned(), "loid".to_owned()),
+			("x-reddit-session".to_owned(), "session".to_owned()),
+		]);
+		let headers = std::collections::HashMap::<_, _>::from_iter(oauth_headers(headers, Some("account")));
+
+		assert_eq!(headers.get("Authorization").map(String::as_str), Some("Bearer account"));
+		assert_eq!(headers.get("User-Agent").map(String::as_str), Some("Reddit/test"));
+		assert!(!headers.contains_key("x-reddit-loid"));
+		assert!(!headers.contains_key("x-reddit-session"));
 	}
 
 	#[tokio::test]
